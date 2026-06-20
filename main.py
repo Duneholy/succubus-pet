@@ -96,6 +96,7 @@ class DesktopPet:
         self.update_geometry()
         
         self.reminders = []
+        self.regular_reminders = []
         self.is_running = False
         
         self.cursor_auto_remaining = 100.0
@@ -224,7 +225,7 @@ class DesktopPet:
         self.settings.title("Succubus Pet - Настройки")
         
         width = 500
-        height = 350
+        height = 550
         x = (self.settings.winfo_screenwidth() // 2) - (width // 2)
         y = (self.settings.winfo_screenheight() // 2) - (height // 2)
         self.settings.geometry(f"{width}x{height}+{x}+{y}")
@@ -264,6 +265,35 @@ class DesktopPet:
             
             self.reminder_rows.append((cb_h, cb_m, entry))
             
+        ttk.Separator(self.settings, orient='horizontal').pack(fill='x', padx=20, pady=10)
+        tk.Label(self.settings, text="Регулярные уведомления (интервалы)", font=("Arial", 10, "bold")).pack(pady=5)
+        
+        self.regular_reminder_rows = []
+        reg_frame = tk.Frame(self.settings)
+        reg_frame.pack(pady=5)
+        
+        reg_hours = [str(h) for h in range(13)]
+        reg_mins = [f"{m:02d}" for m in range(0, 60, 5)]
+        
+        for i in range(3):
+            row_frame = tk.Frame(reg_frame)
+            row_frame.pack(fill='x', pady=3)
+            
+            cb_h = ttk.Combobox(row_frame, values=reg_hours, width=3, state="readonly")
+            cb_h.set("0")
+            cb_h.pack(side='left', padx=2)
+            tk.Label(row_frame, text="ч").pack(side='left')
+            
+            cb_m = ttk.Combobox(row_frame, values=reg_mins, width=3, state="readonly")
+            cb_m.set("00")
+            cb_m.pack(side='left', padx=2)
+            tk.Label(row_frame, text="м").pack(side='left')
+            
+            entry = tk.Entry(row_frame, width=38)
+            entry.pack(side='left', padx=10)
+            
+            self.regular_reminder_rows.append((cb_h, cb_m, entry))
+            
         btn_frame = tk.Frame(self.settings)
         btn_frame.pack(pady=15)
         
@@ -301,6 +331,26 @@ class DesktopPet:
                     'text': text,
                     'triggered_today': False
                 })
+                
+        new_regular_reminders = []
+        for h_cb, m_cb, entry in self.regular_reminder_rows:
+            text = entry.get().strip()
+            h = int(h_cb.get())
+            m = int(m_cb.get())
+            interval_seconds = h * 3600 + m * 60
+            if text and interval_seconds > 0:
+                last_triggered = time.time()
+                for old_rem in getattr(self, 'regular_reminders', []):
+                    if old_rem['interval'] == interval_seconds and old_rem['text'] == text:
+                        last_triggered = old_rem['last_triggered']
+                        break
+                new_regular_reminders.append({
+                    'interval': interval_seconds,
+                    'last_triggered': last_triggered,
+                    'text': text
+                })
+        self.regular_reminders = new_regular_reminders
+        
         self.hide_settings()
         self.root.deiconify()
         self.is_running = True
@@ -423,7 +473,13 @@ class DesktopPet:
 
     def on_click(self, event):
         now = time.time()
-        if now - self.last_click_time <= 1.0:
+        diff = now - self.last_click_time
+        
+        # Ignore event bubbling (multiple events for a single click)
+        if diff < 0.05:
+            return "break"
+            
+        if diff <= 0.4:
             self.check_cursor_usage(manual=True)
             self.last_click_time = 0.0
         else:
@@ -434,6 +490,7 @@ class DesktopPet:
                 self.current_frame = 0 # reset animation to start
                 self.canvas.itemconfig(self.text_item, state='hidden')
                 self.canvas.itemconfig(self.text_bg_item, state='hidden')
+        return "break"
 
     def update_geometry(self):
         win_x = int(self.x) - self.image_offset_x
@@ -473,6 +530,23 @@ class DesktopPet:
                     reminder_active = True
             elif r['triggered_today'] and local_time.tm_min != r['minute']:
                 r['triggered_today'] = False
+                
+        for r in self.regular_reminders:
+            if now - r['last_triggered'] >= r['interval']:
+                with open("debug_log.txt", "a") as f:
+                    f.write(f"Triggered regular reminder: {r['text']}, interval: {r['interval']}, last: {r['last_triggered']}, now: {now}\n")
+                r['last_triggered'] = now
+                
+                was_flying = (self.state == 'fly_to_center')
+                self.state = 'fly_to_center'
+                self.target_x = self.screen_width // 2 - self.width // 2
+                self.target_y = self.screen_height // 2 - self.height // 2
+                
+                if hasattr(self, 'current_reminder_text') and getattr(self, 'current_reminder_text', '') and was_flying:
+                    self.current_reminder_text += "\n" + r['text']
+                else:
+                    self.current_reminder_text = "Регулярное уведомление: " + r['text']
+                reminder_active = True
                 
         if reminder_active:
             pass
