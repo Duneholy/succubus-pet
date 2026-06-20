@@ -10,6 +10,10 @@ import pystray
 from pystray import MenuItem as item
 import threading
 from tkinter import ttk
+import sqlite3
+import json
+import urllib.request
+import subprocess
 class DesktopPet:
     def __init__(self):
         self.root = tk.Tk()
@@ -94,12 +98,106 @@ class DesktopPet:
         self.reminders = []
         self.is_running = False
         
+        self.cursor_auto_remaining = 100.0
+        self.cursor_api_remaining = 100.0
+        self.last_cursor_check_time = time.time()
+        self.cursor_check_interval = 300 # 5 minutes
+        self.last_click_time = 0.0
+        
         self.setup_tray()
         self.create_settings_window()
         
         # Start loops
         self.root.after(50, self.update)
         self.root.after(100, self.animate)
+
+    def is_cursor_running(self):
+        try:
+            output = subprocess.check_output('tasklist /fi "imagename eq Cursor.exe"', shell=True).decode('cp866', errors='ignore')
+            return "Cursor.exe" in output
+        except Exception:
+            return False
+
+    def check_cursor_usage(self, manual=False):
+        def _fetch_and_process():
+            if not manual and not self.is_cursor_running():
+                return
+                
+            db_path = os.path.expanduser(r"~\AppData\Roaming\Cursor\User\globalStorage\state.vscdb")
+            if not os.path.exists(db_path):
+                return
+                
+            try:
+                conn = sqlite3.connect(db_path)
+                val = conn.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/accessToken'").fetchone()
+                conn.close()
+                
+                if not val:
+                    return
+                    
+                token = val[0]
+                if token.startswith('"'): 
+                    token = json.loads(token)
+                    
+                url = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+                req = urllib.request.Request(url, data=b"{}", headers={
+                    "Authorization": f"Bearer {token}", 
+                    "User-Agent": "Cursor", 
+                    "Content-Type": "application/json"
+                })
+                res = urllib.request.urlopen(req).read().decode()
+                data = json.loads(res)
+                
+                plan = data.get("planUsage", {})
+                auto_used = plan.get("autoPercentUsed", 0)
+                api_used = plan.get("apiPercentUsed", 0)
+                
+                new_auto = max(0.0, 100.0 - auto_used)
+                new_api = max(0.0, 100.0 - api_used)
+                
+                if manual:
+                    self.root.after(0, lambda: self.trigger_manual_cursor_notification(new_auto, new_api))
+                else:
+                    self.root.after(0, lambda: self.evaluate_cursor_thresholds("Composer", self.cursor_auto_remaining, new_auto))
+                    self.root.after(0, lambda: self.evaluate_cursor_thresholds("API", self.cursor_api_remaining, new_api))
+                    
+                self.cursor_auto_remaining = new_auto
+                self.cursor_api_remaining = new_api
+                
+            except Exception as e:
+                print("Cursor fetch error:", e)
+        
+        threading.Thread(target=_fetch_and_process, daemon=True).start()
+
+    def trigger_manual_cursor_notification(self, auto_rem, api_rem):
+        self.state = 'talk'
+        self.state_timer = 150 # 4.5 seconds
+        self.show_text_bubble(f"У нас осталось {int(auto_rem)}% Composer и {int(api_rem)}% API в Cursor")
+        
+    def evaluate_cursor_thresholds(self, name, old_val, new_val):
+        old_step = int(old_val / 5) * 5
+        new_step = int(new_val / 5) * 5
+        
+        if new_step < old_step:
+            if new_step <= 10:
+                if name == "Composer":
+                    msg = f"Эй, полегче с Composer'ом, у нас осталось всего {new_step}% запросов!"
+                else:
+                    msg = f"Эй, полегче с API Cursor, у нас осталось всего {new_step}% запросов ко внешним моделям!"
+            else:
+                if name == "Composer":
+                    msg = f"Ты потратил 5% запросов к Composer! Осталось {new_step}%"
+                else:
+                    msg = f"Ты потратил 5% запросов к API внешних Cursor моделей! Осталось {new_step}%"
+            
+            if hasattr(self, 'current_reminder_text') and self.state == 'fly_to_center':
+                self.current_reminder_text += "\n" + msg
+            else:
+                self.current_reminder_text = "Уведомление: " + msg
+                self.target_x = self.screen_width // 2
+                self.target_y = self.screen_height // 2
+                self.state = 'fly_to_center'
+                self.state_timer = 0
 
     def setup_tray(self):
         try:
@@ -324,12 +422,18 @@ class DesktopPet:
         self.last_key_time = time.time()
 
     def on_click(self, event):
-        if self.state != 'click' and self.frames_click_left:
-            self.state = 'click'
-            self.state_timer = 50 
-            self.current_frame = 0 # reset animation to start
-            self.canvas.itemconfig(self.text_item, state='hidden')
-            self.canvas.itemconfig(self.text_bg_item, state='hidden')
+        now = time.time()
+        if now - self.last_click_time <= 1.0:
+            self.check_cursor_usage(manual=True)
+            self.last_click_time = 0.0
+        else:
+            self.last_click_time = now
+            if self.state not in ['click', 'talk', 'grab', 'fly_to_center']:
+                self.state = 'click'
+                self.state_timer = 50 
+                self.current_frame = 0 # reset animation to start
+                self.canvas.itemconfig(self.text_item, state='hidden')
+                self.canvas.itemconfig(self.text_bg_item, state='hidden')
 
     def update_geometry(self):
         win_x = int(self.x) - self.image_offset_x
@@ -348,6 +452,13 @@ class DesktopPet:
         dist_to_mouse = math.hypot(mx - cx, my - cy)
         
         now = time.time()
+        
+        # Check cursor api every 5 minutes
+        if now - self.last_cursor_check_time > self.cursor_check_interval:
+            self.last_cursor_check_time = now
+            self.check_cursor_usage()
+        
+        current_time = time.strftime("%H:%M")
         local_time = time.localtime(now)
         
         reminder_active = False
