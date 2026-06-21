@@ -14,6 +14,51 @@ import sqlite3
 import json
 import urllib.request
 import subprocess
+
+
+class ClipboardMonitor:
+    """Monitors the system clipboard for text changes using tkinter's clipboard API."""
+    
+    def __init__(self, root, max_history=30, poll_interval_ms=500):
+        self.root = root
+        self.max_history = max_history
+        self.poll_interval_ms = poll_interval_ms
+        self.clipboard_history = []  # list of full text strings, newest first
+        self._last_text = None
+        
+        # Start polling on main thread via tkinter after
+        self._poll()
+    
+    def _poll(self):
+        """Poll clipboard on the main thread using tkinter."""
+        try:
+            text = self.root.clipboard_get()
+            if text and text.strip() and text != self._last_text:
+                self._last_text = text
+                # Remove duplicate if exists
+                if text in self.clipboard_history:
+                    self.clipboard_history.remove(text)
+                # Add to front
+                self.clipboard_history.insert(0, text)
+                # Trim to max
+                if len(self.clipboard_history) > self.max_history:
+                    self.clipboard_history = self.clipboard_history[:self.max_history]
+        except (tk.TclError, Exception):
+            pass
+        self.root.after(self.poll_interval_ms, self._poll)
+    
+    def get_history(self):
+        """Return a copy of the clipboard history list."""
+        return list(self.clipboard_history)
+    
+    def copy_to_clipboard(self, text):
+        """Write text to system clipboard using tkinter."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self._last_text = text
+        except Exception as e:
+            print(f"Clipboard write error: {e}")
 class DesktopPet:
     def __init__(self):
         self.root = tk.Tk()
@@ -105,6 +150,10 @@ class DesktopPet:
         self.cursor_check_interval = 300 # 5 minutes
         self.last_click_time = 0.0
         
+        # Clipboard history
+        self.clipboard_monitor = ClipboardMonitor(self.root, max_history=30)
+        self.clipboard_popup = None
+        
         self.setup_tray()
         self.create_settings_window()
         
@@ -171,7 +220,7 @@ class DesktopPet:
         threading.Thread(target=_fetch_and_process, daemon=True).start()
 
     def trigger_manual_cursor_notification(self, auto_rem, api_rem):
-        self.state = 'talk'
+        self.state = random.choice(['talk', 'talk_idle'])
         self.state_timer = 150 # 4.5 seconds
         self.show_text_bubble(f"У нас осталось {int(auto_rem)}% Composer и {int(api_rem)}% API в Cursor")
         
@@ -385,9 +434,10 @@ class DesktopPet:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
                 
             w, h = img.size
-            if w > 100:
-                scale = 100.0 / w
-                new_w = 100
+            target_w = 90
+            if w > target_w:
+                scale = target_w / w
+                new_w = target_w
                 new_h = int(h * scale)
                 img = img.resize((new_w, new_h), Image.NEAREST)
             else:
@@ -397,7 +447,7 @@ class DesktopPet:
             datas = img.getdata()
             new_data = []
             for item in datas:
-                if item[3] < 128:
+                if item[3] < 200:
                     new_data.append((255, 0, 255, 255))
                 else:
                     new_data.append((item[0], item[1], item[2], 255))
@@ -556,15 +606,15 @@ class DesktopPet:
                 if not self.is_typing:
                     self.is_typing = True
                     self.typing_start_time = now
-                elif now - self.typing_start_time > 8.0 and self.state not in ['talk', 'click']:
-                    self.state = 'talk'
+                elif now - self.typing_start_time > 8.0 and self.state not in ['talk', 'talk_idle', 'click']:
+                    self.state = random.choice(['talk', 'talk_idle'])
                     self.state_timer = 100 # 3 seconds
                     self.show_text_bubble("Хороший мальчик... Продолжай печатать")
             else:
                 self.is_typing = False
         
         # State transitions
-        if self.state not in ['grab_mouse', 'talk', 'click', 'fly_to_center']:
+        if self.state not in ['grab_mouse', 'talk', 'talk_idle', 'click', 'fly_to_center']:
             if dist_to_mouse < 100 and random.random() < 0.02:
                 self.state = 'grab_mouse'
                 self.state_timer = 60 # hold for ~2 seconds
@@ -574,7 +624,7 @@ class DesktopPet:
         self.state_timer -= 1
         
         # Behavior based on state
-        if self.state == 'talk':
+        if self.state in ('talk', 'talk_idle'):
             if self.state_timer <= 0:
                 self.canvas.itemconfig(self.text_item, state='hidden')
                 self.canvas.itemconfig(self.text_bg_item, state='hidden')
@@ -607,7 +657,7 @@ class DesktopPet:
             if dist < 10.0:
                 self.x = self.target_x
                 self.y = self.target_y
-                self.state = 'talk'
+                self.state = random.choice(['talk', 'talk_idle'])
                 self.state_timer = 333
                 self.show_text_bubble(self.current_reminder_text)
                 
@@ -644,6 +694,8 @@ class DesktopPet:
             frames = self.frames_grab_right if self.facing_right else self.frames_grab_left
         elif self.state == 'talk':
             frames = self.frames_talk_right if self.facing_right else self.frames_talk_left
+        elif self.state == 'talk_idle':
+            frames = self.frames_idle_right if self.facing_right else self.frames_idle_left
         elif self.state == 'click':
             frames = self.frames_click_right if self.facing_right else self.frames_click_left
         elif self.state == 'bored':
@@ -664,12 +716,213 @@ class DesktopPet:
         
         self.root.after(delay if frames else 100, self.animate)
 
+    def show_clipboard_popup(self, event=None):
+        """Show clipboard history popup on right-click."""
+        # Close existing popup if open
+        if self.clipboard_popup and self.clipboard_popup.winfo_exists():
+            self.close_clipboard_popup()
+            return
+        
+        history = self.clipboard_monitor.get_history()
+        
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.attributes("-alpha", 0.7)
+        self.clipboard_popup = popup
+        
+        # Use transparent color for truly rounded corners
+        popup_transparent = '#ff00ff'
+        popup.config(bg=popup_transparent)
+        popup.wm_attributes("-transparentcolor", popup_transparent)
+        
+        popup_width = 280
+        popup_height = 400
+        
+        # Position near the pet
+        px = int(self.x) + self.width + 10
+        py = int(self.y) - popup_height // 2 + self.height // 2
+        
+        # Keep on screen
+        if px + popup_width > self.screen_width:
+            px = int(self.x) - popup_width - 10
+        if py < 0:
+            py = 0
+        if py + popup_height > self.screen_height:
+            py = self.screen_height - popup_height
+        
+        popup.geometry(f"{popup_width}x{popup_height}+{px}+{py}")
+        
+        # Main canvas with transparent background for rounded shape
+        bg_canvas = tk.Canvas(popup, width=popup_width, height=popup_height,
+                              highlightthickness=0, bg=popup_transparent)
+        bg_canvas.pack(fill='both', expand=True)
+        
+        # Draw rounded rectangle with true rounded corners
+        r = 30
+        fill_color = '#808080'
+        x1, y1, x2, y2 = 0, 0, popup_width, popup_height
+        # Corner arcs
+        bg_canvas.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90, fill=fill_color, outline=fill_color)
+        bg_canvas.create_arc(x2-2*r, y1, x2, y1+2*r, start=0, extent=90, fill=fill_color, outline=fill_color)
+        bg_canvas.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90, fill=fill_color, outline=fill_color)
+        bg_canvas.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90, fill=fill_color, outline=fill_color)
+        # Fill rectangles between arcs
+        bg_canvas.create_rectangle(x1+r, y1, x2-r, y2, fill=fill_color, outline=fill_color)
+        bg_canvas.create_rectangle(x1, y1+r, x2, y2-r, fill=fill_color, outline=fill_color)
+        
+        item_color = '#6a6a6a'
+        
+        # Load button icons with proper transparency compositing
+        btn_dir = os.path.join(os.path.dirname(__file__), 'assets', 'buttons')
+        
+        def load_icon_with_bg(path, size, bg_hex):
+            """Load PNG icon and composite alpha onto a solid background color."""
+            img = Image.open(path).convert('RGBA').resize(size, Image.LANCZOS)
+            r_bg = int(bg_hex[1:3], 16)
+            g_bg = int(bg_hex[3:5], 16)
+            b_bg = int(bg_hex[5:7], 16)
+            bg = Image.new('RGBA', size, (r_bg, g_bg, b_bg, 255))
+            composited = Image.alpha_composite(bg, img)
+            return ImageTk.PhotoImage(composited.convert('RGB'))
+        
+        try:
+            self._clipboard_icon = load_icon_with_bg(os.path.join(btn_dir, 'c.png'), (18, 18), fill_color)
+        except Exception:
+            self._clipboard_icon = None
+        try:
+            self._use_icon = load_icon_with_bg(os.path.join(btn_dir, 'use.png'), (16, 16), item_color)
+        except Exception:
+            self._use_icon = None
+        
+        # Header
+        header_frame = tk.Frame(bg_canvas, bg=fill_color)
+        bg_canvas.create_window(popup_width // 2, 20, window=header_frame, anchor='n')
+        
+        if self._clipboard_icon:
+            icon_label = tk.Label(header_frame, image=self._clipboard_icon, bg=fill_color)
+            icon_label.pack(side='left', padx=(5, 2))
+        
+        title_label = tk.Label(header_frame, text="\u0411\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430", font=("Arial", 11, "bold"),
+                               fg='white', bg=fill_color)
+        title_label.pack(side='left', padx=2)
+        
+        close_btn = tk.Label(header_frame, text="\u2715", font=("Arial", 12, "bold"),
+                             fg='#cccccc', bg=fill_color, cursor='hand2')
+        close_btn.pack(side='right', padx=5)
+        close_btn.bind("<Button-1>", lambda e: self.close_clipboard_popup())
+        close_btn.bind("<Enter>", lambda e: close_btn.config(fg='white'))
+        close_btn.bind("<Leave>", lambda e: close_btn.config(fg='#cccccc'))
+        
+        # Scrollable area for items
+        list_frame_container = tk.Frame(bg_canvas, bg=fill_color)
+        bg_canvas.create_window(popup_width // 2, 55, window=list_frame_container,
+                                anchor='n', width=popup_width - 30)
+        
+        # Canvas + scrollbar for scrolling
+        list_canvas = tk.Canvas(list_frame_container, bg=fill_color, highlightthickness=0,
+                                height=popup_height - 80)
+        scrollbar = tk.Scrollbar(list_frame_container, orient='vertical', command=list_canvas.yview)
+        scrollable_frame = tk.Frame(list_canvas, bg=fill_color)
+        
+        scrollable_frame.bind("<Configure>",
+                              lambda e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
+        
+        list_canvas.create_window((0, 0), window=scrollable_frame, anchor='nw',
+                                  width=popup_width - 50)
+        list_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        list_canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Mouse wheel scrolling
+        def on_mousewheel(event):
+            list_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        
+        popup.bind("<MouseWheel>", on_mousewheel)
+        list_canvas.bind("<MouseWheel>", on_mousewheel)
+        
+        
+        if not history:
+            empty_label = tk.Label(scrollable_frame, text="\u041f\u043e\u043a\u0430 \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d\u043e",
+                                   font=("Arial", 9), fg='#aaaaaa', bg=fill_color)
+            empty_label.pack(pady=20)
+        else:
+            for i, full_text in enumerate(history):
+                # Truncate display text to 20 chars
+                display_text = full_text.replace('\n', ' ').replace('\r', '')
+                if len(display_text) > 20:
+                    display_text = display_text[:20] + "..."
+                
+                item_frame = tk.Frame(scrollable_frame, bg=item_color, pady=2, padx=4)
+                item_frame.pack(fill='x', pady=2, padx=2)
+                
+                text_label = tk.Label(item_frame, text=display_text, font=("Arial", 9),
+                                      fg='white', bg=item_color, anchor='w')
+                text_label.pack(side='left', fill='x', expand=True, padx=(4, 2))
+                
+                if self._use_icon:
+                    copy_btn = tk.Label(item_frame, image=self._use_icon,
+                                        bg=item_color, cursor='hand2', padx=4)
+                else:
+                    copy_btn = tk.Label(item_frame, text="\U0001f4c4", font=("Arial", 10),
+                                        fg='#aaaaaa', bg=item_color, cursor='hand2', padx=4)
+                copy_btn.pack(side='right')
+                
+                # Closure to capture full_text and btn reference
+                def make_copy_handler(txt, btn, has_icon):
+                    def handler(e):
+                        self.clipboard_monitor.copy_to_clipboard(txt)
+                        if has_icon:
+                            btn.config(text="\u2713", image='', compound='none')
+                            popup.after(800, lambda: btn.config(image=self._use_icon, text='') if btn.winfo_exists() else None)
+                        else:
+                            btn.config(text="\u2713")
+                            popup.after(800, lambda: btn.config(text="\U0001f4c4") if btn.winfo_exists() else None)
+                    return handler
+                
+                copy_btn.bind("<Button-1>", make_copy_handler(full_text, copy_btn, bool(self._use_icon)))
+                copy_btn.bind("<Enter>", lambda e, b=copy_btn: b.config(fg='white'))
+                copy_btn.bind("<Leave>", lambda e, b=copy_btn: b.config(fg='#aaaaaa'))
+                
+                # Bind mousewheel on item elements too
+                text_label.bind("<MouseWheel>", on_mousewheel)
+                item_frame.bind("<MouseWheel>", on_mousewheel)
+                copy_btn.bind("<MouseWheel>", on_mousewheel)
+        
+        # Close popup when clicking outside
+        def check_focus(event):
+            try:
+                if self.clipboard_popup and self.clipboard_popup.winfo_exists():
+                    mx = self.clipboard_popup.winfo_pointerx()
+                    my = self.clipboard_popup.winfo_pointery()
+                    wx = self.clipboard_popup.winfo_rootx()
+                    wy = self.clipboard_popup.winfo_rooty()
+                    ww = self.clipboard_popup.winfo_width()
+                    wh = self.clipboard_popup.winfo_height()
+                    if not (wx <= mx <= wx + ww and wy <= my <= wy + wh):
+                        self.close_clipboard_popup()
+            except:
+                pass
+        
+        popup.bind("<FocusOut>", check_focus)
+        popup.focus_force()
+    
+    def close_clipboard_popup(self):
+        """Close the clipboard history popup."""
+        if self.clipboard_popup and self.clipboard_popup.winfo_exists():
+            self.clipboard_popup.destroy()
+            self.clipboard_popup = None
+
     def run(self):
         self.root.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-1>", self.on_click)
         if self.image_item is not None:
             self.canvas.tag_bind(self.image_item, "<Button-1>", self.on_click)
-        self.root.bind("<Button-3>", lambda e: os._exit(0))
+        self.root.bind("<Button-3>", self.show_clipboard_popup)
+        self.canvas.bind("<Button-3>", self.show_clipboard_popup)
+        if self.image_item is not None:
+            self.canvas.tag_bind(self.image_item, "<Button-3>", self.show_clipboard_popup)
         self.root.mainloop()
 
 if __name__ == '__main__':
